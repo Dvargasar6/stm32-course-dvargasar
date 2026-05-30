@@ -15,6 +15,16 @@ uint8_t short_state = 1;
 
 int main(void)
 {
+	// Setup input:
+	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
+
+	GPIOC->MODER &= ~(GPIO_MODER_MODE13);
+	GPIOC->PUPDR &= ~(GPIO_PUPDR_PUPD13);
+	GPIOC->PUPDR |= GPIO_PUPDR_PUPD13_0;
+	//GPIOC->IDR &= ~(GPIO_IDR_ID13);
+	//GPIOC->IDR |= GPIO_IDR_ID13;
+
+
     // Habilita el reloj del puerto GPIOA en el bus AHB1.
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
 
