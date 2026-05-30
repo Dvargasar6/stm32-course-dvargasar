@@ -3,12 +3,12 @@
 
 typedef enum {
     GREEN,
-    YELLOW_RED,
-    RED,
-	YELLOW_GREEN
+    YELLOW,
+    RED
 } TrafficState;
 
 volatile TrafficState current_state = GREEN;
+volatile TrafficState next_state = RED;
 volatile uint32_t timer_count = 0;
 uint8_t long_state = 5;
 uint8_t short_state = 1;
@@ -97,17 +97,18 @@ void TIM3_IRQHandler(void){
 
 			if(timer_count >= long_state){
 				timer_count = 0;
-				current_state = YELLOW_RED;
+				current_state = YELLOW;
+				next_state = RED;
 			}
 			break;
 
-		case YELLOW_RED:
+		case YELLOW:
 			GPIOA->ODR &= ~(GPIO_ODR_OD5 | GPIO_ODR_OD7);
 			GPIOA->ODR |= GPIO_ODR_OD6;
 
 			if(timer_count >= short_state){
 				timer_count = 0;
-				current_state = RED;
+				current_state = next_state;
 			}
 			break;
 
@@ -117,19 +118,11 @@ void TIM3_IRQHandler(void){
 
 			if(timer_count >= long_state){
 				timer_count = 0;
-				current_state = YELLOW_GREEN;
+				current_state = YELLOW;
+				next_state = GREEN;
 			}
 			break;
 
-		case YELLOW_GREEN:
-			GPIOA->ODR &= ~(GPIO_ODR_OD5 | GPIO_ODR_OD7);
-			GPIOA->ODR |= GPIO_ODR_OD6;
-
-			if(timer_count >= short_state){
-				timer_count = 0;
-				current_state = GREEN;
-			}
-			break;
 
 		}
 
