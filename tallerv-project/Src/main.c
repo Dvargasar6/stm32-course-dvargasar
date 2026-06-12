@@ -39,18 +39,20 @@ volatile uint16_t portB_mask_buffer[14];
 volatile uint8_t isr_state_index = 0;
 
 void init_gpio(void) {
-	// Habilitar reloj para el puerto C
-	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
 
-	// Configurar puerto PC0 como entrada
+	// Enable clock for C port
+	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN | RCC_AHB1ENR_GPIOCEN;
+
+	// Setup PC0 and PC1 GPIO as inputs
 	GPIOC->MODER &= ~(GPIO_MODER_MODE0);
 	GPIOC->PUPDR &= ~(GPIO_PUPDR_PUPD0);
 
-	// Configurar puerto PC1 como entrada
 	GPIOC->MODER &= ~(GPIO_MODER_MODE1);
 	GPIOC->PUPDR &= ~(GPIO_PUPDR_PUPD1);
 
-	RCC->AHB1ENR |= (1 << 0) | (1 << 1);
+	// Setup
+	//RCC->AHB1ENR |= (1 << 0) | (1 << 1);
+	//RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN;
 
 	// Configure PA0, PA1, PA4-PA8 as General Purpose Outputs (01)
 	GPIOA->MODER &=
@@ -224,8 +226,8 @@ int main(void) {
 	while (1) {
 		// ... codigo existente del multiplexado del display ...
 		int32_t valor = contador;
-		if (valor < 0)  valor = 0;     // saturacion inferior (ver nota abajo)
-		if (valor > 99) valor = 99;    // saturacion superior: limite fisico del display
+		if (valor < 0)  valor += 100;     // saturacion inferior (ver nota abajo)
+		if (valor > 99) valor -= 100;    // saturacion superior: limite fisico del display
 		display_buffer[0] = valor / 10; // decenas
 		display_buffer[1] = valor % 10; // unidades
 
