@@ -1,21 +1,10 @@
-#include "stm32f411xe.h" // Archivo de cabecera con las definiciones de los registros
+#include "stm32f411xe.h"
 
-// Contador principal:
-volatile int32_t counter = 0;
-int32_t value = 0;
+/*
+ * Segment patterns are the masks for turn on each number (0-9) in each port (A,B and C)
+ */
 
-// Tick global incrementado por SysTick cada 1 ms.
-volatile uint32_t tick_ms = 0;
-
-// Marcas de tiempo independientes del ultimo flanco aceptado por cada canal.
-// Mantenerlas separadas evita que un flanco en una linea inhiba el debounce
-// de la otra, lo cual seria erroneo al tratarse de dos fotointerruptores
-// fisicamente independientes.
-volatile uint32_t ultimo_flanco_pb1_ms  = 0;
-volatile uint32_t ultimo_flanco_pb12_ms = 0;
-
-#define DEBOUNCE_MS  50U
-
+// Outputs pins used in PA: PA10:
 const uint16_t segment_pattern_a[10] = { 0x0400, // 0
 		0x0400, // 1
 		0x0400, // 2
@@ -28,18 +17,20 @@ const uint16_t segment_pattern_a[10] = { 0x0400, // 0
 		0x0400  // 9
 		};
 
+// Outputs pins used in PB: PB7 and PB8:
 const uint16_t segment_pattern_b[10] = { 0x0100, // 0
 		0x0000, // 1
-		0x0000, // 2
-		0x0000, // 3
-		0x0100, // 4
-		0x0100, // 5
-		0x0100, // 6
+		0x0080, // 2
+		0x0080, // 3
+		0x0180, // 4
+		0x0180, // 5
+		0x0180, // 6
 		0x0000, // 7
-		0x0100, // 8
-		0x0100  // 9
+		0x0180, // 8
+		0x0180  // 9
 		};
 
+// Outputs pins used in PC: PC2, PC9, PC11 and PC12:
 const uint16_t segment_pattern_c[10] = { 0x1A04, // 0
 		0x0004, // 1
 		0x1A00, // 2
@@ -52,389 +43,369 @@ const uint16_t segment_pattern_c[10] = { 0x1A04, // 0
 		0x0A04  // 9
 		};
 
-const uint16_t segment_pattern_h[10] = { 0x0000, // 0
-		0x0000, // 1
-		0x0002, // 2
-		0x0002, // 3
-		0x0002, // 4
-		0x0002, // 5
-		0x0002, // 6
-		0x0000, // 7
-		0x0002, // 8
-		0x0002  // 9
-		};
+// Arrays for the pins map on each port for segments and PC for digits:
+const uint8_t segment_shift_map_a[1] = { 10 };           // Segments in PA: PA10
+const uint8_t segment_shift_map_b[2] = { 8, 7 };     // Segments in PB: PB7, PB8
+const uint8_t segment_shift_map_c[4] = { 2, 9, 11, 12 }; // Segments in PC: PC2, PC9, PC11, PC12
+const uint8_t digit_shift_map_c[4] = { 6, 10, 4, 3 }; // Digits in PC: PC3, PC4, PC6, PC10
 
-const uint8_t segment_shift_map_a[1] = { 10 };
-const uint8_t segment_shift_map_b[1] = { 8 };
-const uint8_t segment_shift_map_c[4] = { 2, 9, 11, 12 };
-const uint8_t segment_shift_map_h[1] = { 1 };
-const uint8_t digit_shift_map_c[4] = { 6, 10, 4, 3 };
+// Array that contain the number in each digit. {Thousands, Hundreds, Tens, Units}
+volatile uint8_t display_buffer[4] = { 0, 0, 0, 0 };
 
-// Bufer para los numeros a mostrar en pantalla.
-volatile uint8_t display_buffer[4] = { 1, 1, 4, 4 };
+/*
+ * Masks for turn on and turn off each segment and digit in the timer ISR.
+ * For 7 segments in 4 digits exists 28 states.
+ */
 
 #define MULTIPLEX_STATES 28
 volatile uint16_t portA_mask_buffer[MULTIPLEX_STATES];
 volatile uint16_t portB_mask_buffer[MULTIPLEX_STATES];
 volatile uint16_t portC_mask_buffer[MULTIPLEX_STATES];
-volatile uint16_t portH_mask_buffer[MULTIPLEX_STATES];
-
 volatile uint16_t portC_mask_digits[MULTIPLEX_STATES];
+
+volatile int32_t counter = 0;   // Counter
+int32_t value = 0;              // Value in display
+
+
+// Timestamps to avoid flanks that are too close due to rebounds:
+volatile uint32_t global_time = 0;
+volatile uint32_t pb1_time = 0;
+volatile uint32_t pb12_time = 0;
+#define DEBOUNCE_MS  50U
 
 volatile uint8_t isr_state_index = 0;
 
+/*
+ * Function to setup the required GPIOs:
+ * Digits: PC3, PC4, PC6, PC10
+ * Segments: PA10, PB7, PB8, PC2, PC9, PC11, PC12
+ * Blinky: PH1
+ */
 void init_gpio(void) {
-	// Habilitacion del reloj para los puertos A, B, C y H:
+
+	/*
+	 * Enable clocks for required ports: A, B, C and H.
+	 * Port H is for blinky.
+	 */
 	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN
 			| RCC_AHB1ENR_GPIOCEN | RCC_AHB1ENR_GPIOHEN;
 
-	// Pausa para estabilizacion de la senal de reloj
 	__asm("nop");
 
-	// Configuracion de PB1 y PB12 como entradas (Fotointerruptores):
+	// Setup PB1 and PB12 as inputs (photointerrupters):
 	GPIOB->MODER &= ~(GPIO_MODER_MODE1 | GPIO_MODER_MODE12);
 	GPIOB->PUPDR &= ~(GPIO_PUPDR_PUPD1 | GPIO_PUPDR_PUPD12);
 
-	// Configuracion de PC3, PC4, PC6 y PC10 como salidas para los anodos:
+	// Setup PC3, PC4, PC6 and PC10 as outputs (digits):
 	GPIOC->MODER &= ~(GPIO_MODER_MODE3 | GPIO_MODER_MODE4 | GPIO_MODER_MODE6
 			| GPIO_MODER_MODE10);
 	GPIOC->MODER |= (GPIO_MODER_MODE3_0 | GPIO_MODER_MODE4_0
 			| GPIO_MODER_MODE6_0 | GPIO_MODER_MODE10_0);
 
-	// Se establece ALTO logico por defecto para mantener los digitos apagados
-	// en caso de que los catodos esten en bajo (dependiendo de la logica inicial).
+	// Configured in high to keep them off:
 	GPIOC->ODR |= (GPIO_ODR_OD3 | GPIO_ODR_OD4 | GPIO_ODR_OD6 | GPIO_ODR_OD10);
 
-	// Limpieza de bits para configuracion de los segmentos como salidas:
+	// Setup pins for segments:
 	GPIOA->MODER &= ~(GPIO_MODER_MODE10);
-	GPIOB->MODER &= ~(GPIO_MODER_MODE8);
-	GPIOC->MODER &= ~(GPIO_MODER_MODE2);
-	GPIOC->MODER &= ~(GPIO_MODER_MODE9);
-	GPIOC->MODER &= ~(GPIO_MODER_MODE11);
-	GPIOC->MODER &= ~(GPIO_MODER_MODE12);
-	GPIOH->MODER &= ~(GPIO_MODER_MODE1);
+	GPIOB->MODER &= ~(GPIO_MODER_MODE7 | GPIO_MODER_MODE8);
+	GPIOC->MODER &= ~(GPIO_MODER_MODE2 | GPIO_MODER_MODE9 | GPIO_MODER_MODE11
+			| GPIO_MODER_MODE12);
 
-	// Aplicacion del modo de salida general (01 en MODER):
 	GPIOA->MODER |= (GPIO_MODER_MODE10_0);
-	GPIOB->MODER |= (GPIO_MODER_MODE8_0);
+	GPIOB->MODER |= (GPIO_MODER_MODE7_0 | GPIO_MODER_MODE8_0);
 	GPIOC->MODER |= (GPIO_MODER_MODE2_0 | GPIO_MODER_MODE9_0
 			| GPIO_MODER_MODE11_0 | GPIO_MODER_MODE12_0);
-	GPIOH->MODER |= (GPIO_MODER_MODE1_0);
 
-	// Apagado inicial de los segmentos (se asume catodo en ALTO como apagado).
+	/*
+	 *  An 8 is writed to blanked the display for initial state.
+	 *  High state is established as turn off.
+	 */
 	GPIOA->ODR |= segment_pattern_a[8];
 	GPIOB->ODR |= segment_pattern_b[8];
 	GPIOC->ODR |= segment_pattern_c[8];
-	GPIOH->ODR |= segment_pattern_h[8];
 
-	// Encendido estatico inicial de prueba (se sobreescribe luego por el barrido).
-	GPIOC->ODR &= ~(GPIO_ODR_OD3);
-	GPIOA->ODR &= ~segment_pattern_a[9];
-	GPIOB->ODR &= ~segment_pattern_b[9];
-	GPIOC->ODR &= ~segment_pattern_c[9];
-	GPIOH->ODR &= ~segment_pattern_h[9];
+	/*
+	 * Test start:
+	 GPIOC->ODR &= ~(GPIO_ODR_OD3);
+	 GPIOA->ODR &= ~segment_pattern_a[9];
+	 GPIOB->ODR &= ~segment_pattern_b[9];
+	 GPIOC->ODR &= ~segment_pattern_c[9];
+	 */
 
-	// --- Configuracion de PA5 (LED2 de la Nucleo-F411RE) como salida ---
-	// Este pin sirve de heartbeat independiente del barrido del display.
-	// Limpieza del campo MODER5 y seleccion del modo salida general (01).
-	GPIOA->MODER &= ~GPIO_MODER_MODE5;
-	GPIOA->MODER |=  GPIO_MODER_MODE5_0;
+	// Blinky settings (PH1):
+	GPIOH->MODER &= ~GPIO_MODER_MODE1;
+	GPIOH->MODER |= GPIO_MODER_MODE1_0;
+	GPIOH->ODR &= ~GPIO_ODR_OD1;
 
-	// Estado inicial apagado. El blink lo conmutara la ISR de TIM11.
-	GPIOA->ODR &= ~GPIO_ODR_OD5;
 }
 
-void init_tim(void) {
-	// Habilitacion del reloj para el temporizador TIM10
+
+/*
+ *  Funtion to setup TIM10
+ *  that control the dispñay
+ */
+void init_tim10(void) {
+
+	//Enable clock for TIM10
 	RCC->APB2ENR |= RCC_APB2ENR_TIM10EN;
 
-	// Pre-escalador: Reduce la frecuencia base del temporizador
+	// Prescaler and Auto-Reload 16MHz/16 = 1 MHz -> 1 \mu s * 100 = 100 \mu s
 	TIM10->PSC = 16 - 1;
-
-	// Valor de auto-recarga: Determina el tope de conteo y la frecuencia de la interrupcion
 	TIM10->ARR = 100 - 1;
 
-	// Se activa la generacion de interrupciones al desbordarse el contador
+	// Update Interrupt Enable
 	TIM10->DIER |= TIM_DIER_UIE;
 
-	// Habilitacion vectorial en el NVIC (Controlador de interrupciones anidadas)
+	// Enable the interrupt of TIM10 in NVIC (Nested Vectored Interrupt Controller)
 	NVIC_EnableIRQ(TIM1_UP_TIM10_IRQn);
 
-	// Encendido final del temporizador
+	// Counter Enable: Start counting
 	TIM10->CR1 |= TIM_CR1_CEN;
 }
 
+
+/*
+ * Function to setup TIM11
+ * that control blinking led
+ */
 void init_tim11(void) {
-	// Habilitacion del reloj para TIM11 en el bus APB2.
-	// TIM11 se elige por estar libre y poseer su propio vector NVIC, lo que
-	// garantiza independencia respecto a la ISR del barrido del display.
+
 	RCC->APB2ENR |= RCC_APB2ENR_TIM11EN;
 
-	// Pre-escalador: con HSI a 16 MHz, dividir entre 16000 produce una base
-	// de tiempo de 1 kHz (un tick equivale a 1 ms exacto).
+	// Prescaler and Auto-Reload: 16 MHz/16k = 1 kHz -> 1 ms * 500 = 500 ms
 	TIM11->PSC = 16000 - 1;
-
-	// Auto-recarga: 500 ticks de 1 ms = 500 ms por desbordamiento.
-	// Conmutar el LED en cada desbordamiento produce un parpadeo a 1 Hz
-	// (500 ms encendido, 500 ms apagado).
 	TIM11->ARR = 500 - 1;
 
-	// Habilitacion de la interrupcion por evento de actualizacion (overflow).
 	TIM11->DIER |= TIM_DIER_UIE;
-
-	// Habilitacion del vector en el NVIC. En STM32F411 la linea de TIM11
-	// se comparte con TIM1_TRG_COM, lo cual es irrelevante aqui porque
-	// TIM1 no se utiliza en este firmware.
 	NVIC_EnableIRQ(TIM1_TRG_COM_TIM11_IRQn);
-
-	// Arranque del contador.
 	TIM11->CR1 |= TIM_CR1_CEN;
 }
 
+
+/*
+ * Function to setup EXTI
+ * EXTI1:  Rising flank
+ * EXTI12: Falling flank
+ */
 void init_exti(void) {
-	// Habilitacion del reloj para SYSCFG. Este periferico es indispensable
-	// para mapear pines fisicos GPIO a las lineas EXTI internas.
+
+	// Enable the SYSCFG peripheral clock:
 	RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
 
-	// --- Mapeo de la linea EXTI1 al pin PB1 ---
-	// EXTICR[0] agrupa las lineas 0..3. El campo EXTI1 (bits 4..7) selecciona
-	// que puerto (A, B, C, ...) actua como fuente para la linea 1.
-	SYSCFG->EXTICR[0] &= ~(SYSCFG_EXTICR1_EXTI1);    // limpieza del campo
-	SYSCFG->EXTICR[0] |=  SYSCFG_EXTICR1_EXTI1_PB;   // seleccion del puerto B
+	// Mapping EXTI1 and EXTI12 to port B (PB1 and PB12):
+	SYSCFG->EXTICR[0] &= ~(SYSCFG_EXTICR1_EXTI1);
+	SYSCFG->EXTICR[0] |= SYSCFG_EXTICR1_EXTI1_PB;
 
-	// --- Mapeo de la linea EXTI12 al pin PB12 ---
-	// EXTICR[3] agrupa las lineas 12..15. El campo EXTI12 (bits 0..3)
-	// selecciona el puerto fuente para la linea 12.
-	SYSCFG->EXTICR[3] &= ~(SYSCFG_EXTICR4_EXTI12);   // limpieza del campo
-	SYSCFG->EXTICR[3] |=  SYSCFG_EXTICR4_EXTI12_PB;  // seleccion del puerto B
+	SYSCFG->EXTICR[3] &= ~(SYSCFG_EXTICR4_EXTI12);
+	SYSCFG->EXTICR[3] |= SYSCFG_EXTICR4_EXTI12_PB;
 
-	// --- Configuracion de flancos ---
-	// Linea 1 (PB1): activa flanco de subida, desactiva flanco de bajada.
-	EXTI->RTSR |=  EXTI_RTSR_TR1;
+	// Enable rising flank and disable falling flank for EXTI1:
+	EXTI->RTSR |= EXTI_RTSR_TR1;
 	EXTI->FTSR &= ~EXTI_FTSR_TR1;
 
-	// Linea 12 (PB12): activa flanco de bajada, desactiva flanco de subida.
-	EXTI->FTSR |=  EXTI_FTSR_TR12;
+	// Enable falling flank and disable rising flank for EXTI12:
+	EXTI->FTSR |= EXTI_FTSR_TR12;
 	EXTI->RTSR &= ~EXTI_RTSR_TR12;
 
 	// --- Limpieza preventiva de banderas pendientes ---
 	// El registro PR sigue la semantica "write-1-to-clear": escribir 1 en
 	// un bit lo limpia, escribir 0 no tiene efecto. Por eso se asigna
 	// directamente (no se usa |=) para evitar limpiar bits no deseados.
+	// Flag for the
 	EXTI->PR = (EXTI_PR_PR1 | EXTI_PR_PR12);
 
 	// --- Desenmascaramiento de las lineas en el controlador EXTI ---
 	// IMR habilita que la linea pueda generar la solicitud de interrupcion.
 	EXTI->IMR |= (EXTI_IMR_IM1 | EXTI_IMR_IM12);
 
-	// --- Habilitacion vectorial en el NVIC ---
-	// Linea 1: vector dedicado EXTI1_IRQn.
 	NVIC_EnableIRQ(EXTI1_IRQn);
-	// Lineas 10..15: vector compartido EXTI15_10_IRQn. La discriminacion
-	// entre lineas debe hacerse leyendo EXTI->PR dentro del handler.
 	NVIC_EnableIRQ(EXTI15_10_IRQn);
 }
 
+/*
+ * Interruptions Services Routines
+ */
+
+void TIM1_UP_TIM10_IRQHandler(void) {
+
+	/*
+	 * Evaluation if UIF it is up.
+	 * TIM_SR_UIF = 1<<0
+	 */
+
+	if (TIM10->SR & TIM_SR_UIF) {
+
+		// UIF is lowered:
+		TIM10->SR &= ~TIM_SR_UIF;
+
+		// Blanking the display:
+		GPIOC->ODR |= (0x458);
+		GPIOA->ODR |= segment_pattern_a[8];
+		GPIOB->ODR |= segment_pattern_b[8];
+		GPIOC->ODR |= segment_pattern_c[8];
+
+		/*
+		 * In each port register the mask for the current state are writed.
+		 * This mask are generate in while cycle.
+		 */
+		GPIOA->ODR &= ~portA_mask_buffer[isr_state_index];
+		GPIOB->ODR &= ~portB_mask_buffer[isr_state_index];
+		GPIOC->ODR &= ~portC_mask_buffer[isr_state_index];
+		GPIOC->ODR &= ~portC_mask_digits[isr_state_index];
+
+		// It moves to the next state:
+		isr_state_index++;
+
+		// The states counter are reinitialized
+		if (isr_state_index >= 28) {
+			isr_state_index = 0;
+		}
+
+		global_time++;
+	}
+}
+
+void TIM1_TRG_COM_TIM11_IRQHandler(void) {
+
+	if (TIM11->SR & TIM_SR_UIF) {
+		TIM11->SR &= ~TIM_SR_UIF;
+		GPIOH->ODR ^= GPIO_ODR_OD1;
+	}
+}
+
 void EXTI1_IRQHandler(void) {
-	// Vector dedicado a la linea EXTI1 (pin PB1). No requiere discriminacion
-	// de fuente, pero se valida la bandera por consistencia defensiva.
+
+	// It is verified that the interruption flag is up
 	if (EXTI->PR & EXTI_PR_PR1) {
 
-		// Limpieza de la bandera pendiente: el bit es "write-1-to-clear".
-		// Asignacion directa para no afectar otros bits del registro PR.
+		// The interruption flag is lowered:
 		EXTI->PR = EXTI_PR_PR1;
 
-		// Debounce por software: se descartan flancos que ocurran dentro
-		// de la ventana DEBOUNCE_MS posterior al ultimo flanco aceptado.
-		// ADVERTENCIA: tick_ms se incrementa en TIM10 cada 100 us, no cada
-		// 1 ms. La ventana efectiva actual es DEBOUNCE_MS * 100 us = 5 ms.
-		// Esto debera corregirse cuando se ajuste la base de tiempo.
-		if ((tick_ms - ultimo_flanco_pb1_ms) > DEBOUNCE_MS) {
-			counter++;                       // flanco de subida -> incremento
-			ultimo_flanco_pb1_ms = tick_ms;  // se actualiza la marca propia
+		// It is verified that the flank is not due to rebounds:
+		if ((global_time - pb1_time) > DEBOUNCE_MS) {
+			counter++;             // Counter is increases.
+			pb1_time = global_time;
 		}
 	}
 }
 
 void EXTI15_10_IRQHandler(void) {
-	// Vector compartido por las lineas EXTI10 a EXTI15. Es obligatorio
-	// discriminar la fuente leyendo el registro PR antes de actuar; de lo
-	// contrario, un flanco en cualquier otra linea del rango activaria
-	// erroneamente la logica del contador.
+
 	if (EXTI->PR & EXTI_PR_PR12) {
-
-		// Limpieza exclusiva de la bandera de la linea 12.
 		EXTI->PR = EXTI_PR_PR12;
-
-		// Debounce independiente para esta linea, con su propia marca.
-		if ((tick_ms - ultimo_flanco_pb12_ms) > DEBOUNCE_MS) {
-			counter--;                        // flanco de bajada -> decremento
-			ultimo_flanco_pb12_ms = tick_ms;  // se actualiza la marca propia
+		if ((global_time - pb12_time) > DEBOUNCE_MS) {
+			counter--;
+			pb12_time = global_time;
 		}
 	}
 }
 
-void TIM1_UP_TIM10_IRQHandler(void) {
-	// Evaluacion de procedencia de la interrupcion (Update Event)
-	if (TIM10->SR & TIM_SR_UIF) {
-		// Limpieza de bandera de interrupcion por escritura de cero logico
-		TIM10->SR &= ~TIM_SR_UIF;
 
-		// Paso 1: Rutina de apagado absoluto (Blanking). Evita ghosting entre estados.
-		GPIOC->ODR |= (0x458);
-		GPIOA->ODR |= segment_pattern_a[8];
-		GPIOB->ODR |= segment_pattern_b[8];
-		GPIOC->ODR |= segment_pattern_c[8];
-		GPIOH->ODR |= segment_pattern_h[8];
-
-		// Paso 2: Volcado al hardware de las mascaras correspondientes al estado en curso.
-		GPIOA->ODR &= ~portA_mask_buffer[isr_state_index];
-		GPIOB->ODR &= ~portB_mask_buffer[isr_state_index];
-		GPIOC->ODR &= ~portC_mask_buffer[isr_state_index];
-		GPIOH->ODR &= ~portH_mask_buffer[isr_state_index];
-		GPIOC->ODR &= ~portC_mask_digits[isr_state_index];
-
-		isr_state_index++;
-
-		/* * CORRECCION 1:
-		 * Dado que su bucle 'for' temporal evalua 4 digitos con 4 segmentos
-		 * el arreglo se llena estrictamente con 16 estados validos.
-		 * Reiniciar la variable en este limite asegura la sincronia temporal del display.
-		 */
-		if (isr_state_index >= 28) {
-			isr_state_index = 0;
-		}
-
-		tick_ms++;
-	}
-}
-
-void TIM1_TRG_COM_TIM11_IRQHandler(void) {
-	// Validacion del origen de la interrupcion: evento de actualizacion.
-	// Aunque el vector se comparte con TIM1_TRG_COM, solo TIM11 esta
-	// habilitado en este firmware, por lo que la comprobacion alcanza
-	// para discriminar la fuente.
-	if (TIM11->SR & TIM_SR_UIF) {
-
-		// Limpieza de la bandera escribiendo cero en UIF.
-		TIM11->SR &= ~TIM_SR_UIF;
-
-		// Conmutacion atomica de PA5 mediante XOR sobre el registro ODR.
-		// La operacion es logicamente independiente del barrido del display,
-		// lo que convierte a LED2 en un indicador fiable de firmware activo.
-		GPIOA->ODR ^= GPIO_ODR_OD5;
-	}
-}
-
+/*
+ *  Main function
+ */
 int main(void) {
 
 	init_gpio();
-	init_tim();
-	init_tim11();   // heartbeat independiente en LED2 (PA5)
+	init_tim10();
+	init_tim11();
 	init_exti();
 
 	while (1) {
+
+		// Value in display get the value of counter.
 		value = counter;
 
-		// Limites del display e inyeccion al bufer
+		// Limits of display:
 		if (value < 0)
 			value += 10000;
 		if (value > 9999)
 			value -= 10000;
 
-		display_buffer[0] = value / 1000; // millares
-		display_buffer[1] = (value - display_buffer[0] * 1000) / 100; // centenas
+		// Decomposition of the number into powers of ten:
+		display_buffer[0] = value / 1000;                             // Thousands.
+		display_buffer[1] = (value - display_buffer[0] * 1000) / 100; // Hundreds.
 		display_buffer[2] = (value - display_buffer[0] * 1000
-				- display_buffer[1] * 100) / 10; // decenas
+				- display_buffer[1] * 100) / 10;                       // Tens.
 		display_buffer[3] = (value - display_buffer[0] * 1000
-				- display_buffer[1] * 100) % 10; // unidades
+				- display_buffer[1] * 100) % 10;                       // Units.
 
 		uint8_t state_idx = 0;
 
-		// Bucle de iteracion externa sobre los 4 digitos
-
+		// Iteration in the four digits:
 		for (uint8_t digit = 0; digit < 4; digit++) {
-			// Extraccion del digito a representar en esta posicion
+
+			// Extraction of the corresponding digit:
 			uint8_t number = display_buffer[digit];
 
-			// Patrones precalculados de cada puerto para el numero en cuestion
+			// Obtain the pattern for the corresponding number in each port:
 			uint16_t pattern_a = segment_pattern_a[number];
 			uint16_t pattern_b = segment_pattern_b[number];
 			uint16_t pattern_c = segment_pattern_c[number];
-			uint16_t pattern_h = segment_pattern_h[number];
 
-			// Mascara del anodo: siempre reside en el Puerto C, independientemente
-			// de en que puerto este el segmento que se active en cada estado.
+			// Obtain position of bit of digit in port C ODR:
 			uint8_t shift_digit = digit_shift_map_c[digit];
+
+			// Defined the mask for the digit:
 			uint16_t digit_mask = (1 << shift_digit);
 
-			// --- 4 estados correspondientes a los segmentos del Puerto C ---
+			// Iteration in the segments connected in port C:
 			for (uint8_t seg = 0; seg < 4; seg++) {
-				// Posicion del bit del segmento dentro del registro ODR de C
+
+				// Obtain position of bit of segment in port C ODR:
 				uint8_t shift = segment_shift_map_c[seg];
 
-				// Evaluacion AND para determinar si este segmento se ilumina
+				// Boolean to determinate if the segment must be turn on:
 				if (pattern_c & (1 << shift)) {
-					portC_mask_buffer[state_idx] = (1 << shift); // segmento activo
-					portC_mask_digits[state_idx] = digit_mask;   // anodo correspondiente
+
+					// 1 << shift is writed on segment masks array:
+					portC_mask_buffer[state_idx] = (1 << shift);
+
+					// 1 << shift_digit is writed on digit masks array to turn on the anode:
+					portC_mask_digits[state_idx] = digit_mask;
+
 				} else {
-					// Estado "muerto": ni anodo ni segmento se activan,
-					// se preserva el slot temporal sin iluminar nada.
+
 					portC_mask_buffer[state_idx] = 0;
 					portC_mask_digits[state_idx] = 0;
+
 				}
 
-				// Puertos no involucrados en este estado: se fuerzan a cero
-				// para que la ISR no altere bits ajenos al segmento activo.
+				// Anothers ports are established in zero:
 				portA_mask_buffer[state_idx] = 0;
 				portB_mask_buffer[state_idx] = 0;
-				portH_mask_buffer[state_idx] = 0;
 
 				state_idx++;
 			}
 
-			// --- 1 estado correspondiente al unico segmento del Puerto A ---
-			uint8_t shift_a = segment_shift_map_a[0]; // unico pin de A en el display
+			// Repeat the process for the segment in pin PA10:
+			uint8_t shift_a = segment_shift_map_a[0];
 			if (pattern_a & (1 << shift_a)) {
 				portA_mask_buffer[state_idx] = (1 << shift_a);
 				portC_mask_digits[state_idx] = digit_mask;
+
 			} else {
 				portA_mask_buffer[state_idx] = 0;
 				portC_mask_digits[state_idx] = 0;
 			}
-			// Cero en los puertos restantes para este slot temporal
-			portB_mask_buffer[state_idx] = 0;
-			portC_mask_buffer[state_idx] = 0;
-			portH_mask_buffer[state_idx] = 0;
-			state_idx++;
-
-			// --- 1 estado correspondiente al unico segmento del Puerto B ---
-			uint8_t shift_b = segment_shift_map_b[0]; // unico pin de B en el display
-			if (pattern_b & (1 << shift_b)) {
-				portB_mask_buffer[state_idx] = (1 << shift_b);
-				portC_mask_digits[state_idx] = digit_mask;
-			} else {
-				portB_mask_buffer[state_idx] = 0;
-				portC_mask_digits[state_idx] = 0;
-			}
-			portA_mask_buffer[state_idx] = 0;
-			portC_mask_buffer[state_idx] = 0;
-			portH_mask_buffer[state_idx] = 0;
-			state_idx++;
-
-			// --- 1 estado correspondiente al unico segmento del Puerto H ---
-			uint8_t shift_h = segment_shift_map_h[0]; // unico pin de H en el display
-			if (pattern_h & (1 << shift_h)) {
-				portH_mask_buffer[state_idx] = (1 << shift_h);
-				portC_mask_digits[state_idx] = digit_mask;
-			} else {
-				portH_mask_buffer[state_idx] = 0;
-				portC_mask_digits[state_idx] = 0;
-			}
-			portA_mask_buffer[state_idx] = 0;
 			portB_mask_buffer[state_idx] = 0;
 			portC_mask_buffer[state_idx] = 0;
 			state_idx++;
+
+			// Repeat the process for the segments in PB7 and PB8:
+			for (uint8_t seg = 0; seg < 2; seg++) {
+				uint8_t shift = segment_shift_map_b[seg];
+				if (pattern_b & (1 << shift)) {
+					portB_mask_buffer[state_idx] = (1 << shift);
+					portC_mask_digits[state_idx] = digit_mask;
+				} else {
+					portB_mask_buffer[state_idx] = 0;
+					portC_mask_digits[state_idx] = 0;
+				}
+				portA_mask_buffer[state_idx] = 0;
+				portC_mask_buffer[state_idx] = 0;
+				state_idx++;
+			}
 		}
 	}
 }
