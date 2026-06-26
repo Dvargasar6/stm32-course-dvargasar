@@ -207,15 +207,8 @@ void init_exti(void) {
 	EXTI->FTSR |= EXTI_FTSR_TR12;
 	EXTI->RTSR &= ~EXTI_RTSR_TR12;
 
-	// --- Limpieza preventiva de banderas pendientes ---
-	// El registro PR sigue la semantica "write-1-to-clear": escribir 1 en
-	// un bit lo limpia, escribir 0 no tiene efecto. Por eso se asigna
-	// directamente (no se usa |=) para evitar limpiar bits no deseados.
-	// Flag for the
 	EXTI->PR = (EXTI_PR_PR1 | EXTI_PR_PR12);
 
-	// --- Desenmascaramiento de las lineas en el controlador EXTI ---
-	// IMR habilita que la linea pueda generar la solicitud de interrupcion.
 	EXTI->IMR |= (EXTI_IMR_IM1 | EXTI_IMR_IM12);
 
 	NVIC_EnableIRQ(EXTI1_IRQn);
